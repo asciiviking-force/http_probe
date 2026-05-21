@@ -1,0 +1,31 @@
+# HTTP monitor report — started 2026-05-21T16:08:14
+# HTTP/HTTPS Monitor v1.1.0  (released 2026-05-21)
+# Copyright (c) Viking Li - viking.li@walmart.com
+# Per-request rows:  timestamp\tstatus\tlatency_ms\tip\turl\tdetail
+# Event lines start with '# latency' or '# tracert'.
+# timestamp	status	latency_ms	ip	url	detail
+2026-05-21T16:08:15.104	200	705.1	72.52.94.234	https://bgp.he.net	
+2026-05-21T16:08:15.166	200	588.1	142.251.154.119	https://www.google.com	
+2026-05-21T16:08:15.221	200	643.0	23.14.132.187	https://www.walmart.com	
+2026-05-21T16:08:15.359	200	777.3	23.222.206.179	https://www.cisco.com	
+2026-05-21T16:08:15.979	200	1401.9	103.235.46.102	https://www.baidu.com	
+2026-05-21T16:08:17.590	200	585.0	72.52.94.234	https://bgp.he.net	
+2026-05-21T16:08:17.599	200	594.9	23.14.132.187	https://www.walmart.com	
+2026-05-21T16:08:17.612	200	611.6	142.251.153.119	https://www.google.com	
+2026-05-21T16:08:17.794	200	791.3	23.222.206.179	https://www.cisco.com	
+2026-05-21T16:08:18.400	200	1398.7	103.235.46.115	https://www.baidu.com	
+2026-05-21T16:08:20.020	200	597.1	72.52.94.234	https://bgp.he.net	
+2026-05-21T16:08:20.041	200	617.5	142.251.152.119	https://www.google.com	
+2026-05-21T16:08:20.045	200	626.5	23.14.132.187	https://www.walmart.com	
+2026-05-21T16:08:20.196	403	773.5	23.222.206.179	https://www.cisco.com	denied: Forbidden
+2026-05-21T16:08:20.870	200	1449.9	103.235.46.102	https://www.baidu.com	
+2026-05-21T16:08:22.499	200	605.4	72.52.94.234	https://bgp.he.net	
+2026-05-21T16:08:22.511	200	616.4	142.251.150.119	https://www.google.com	
+2026-05-21T16:08:22.529	200	637.0	23.14.132.187	https://www.walmart.com	
+2026-05-21T16:08:22.716	200	826.2	23.222.206.179	https://www.cisco.com	
+2026-05-21T16:08:23.326	200	1434.7	103.235.46.102	https://www.baidu.com	
+2026-05-21T16:08:24.965	200	615.8	72.52.94.234	https://bgp.he.net	
+2026-05-21T16:08:25.064	200	715.0	23.14.132.187	https://www.walmart.com	
+2026-05-21T16:08:25.064	200	712.7	142.251.156.119	https://www.google.com	
+2026-05-21T16:08:25.286	200	931.5	23.222.206.179	https://www.cisco.com	
+2026-05-21T16:08:25.769	200	1413.7	103.235.46.102	https://www.baidu.com	

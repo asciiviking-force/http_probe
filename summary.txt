@@ -1,0 +1,44 @@
+HTTP/HTTPS Monitor Summary
+HTTP/HTTPS Monitor v1.2.0  (released 2026-05-21)
+Copyright (c) Viking Li - viking.li@walmart.com
+============================================================
+Started : 2026-05-21T16:15:49
+Ended   : 2026-05-21T16:15:59
+Duration: 10.29s
+Total requests: 12
+
+Per-URL Statistics
+------------------------------------------------------------
+https://www.google.com
+  total       : 6
+  success     : 6  (100.00%)
+  failure     : 0
+  latency ms  : avg=595.1  min=573.1  max=639.8
+  percentiles : p50=589.8  p95=631.0  p99=638.0  (n=6)
+  status code breakdown:
+    200      : 6
+  resolved IP breakdown:
+    142.251.150.119 : 6
+
+https://www.cisco.com
+  total       : 6
+  success     : 6  (100.00%)
+  failure     : 0
+  latency ms  : avg=816.2  min=781.7  max=856.0
+  percentiles : p50=811.6  p95=852.2  p99=855.2  (n=6)
+  status code breakdown:
+    200      : 6
+  resolved IP breakdown:
+    23.222.206.179  : 6
+
+Status Change Log
+------------------------------------------------------------
+(no status / IP changes observed)
+
+Latency Anomaly Log
+------------------------------------------------------------
+(no latency anomalies recorded)
+
+Traceroute Path Changes
+------------------------------------------------------------
+(traceroute disabled)
