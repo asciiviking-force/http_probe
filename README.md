@@ -1,6 +1,6 @@
 # http_monitor
 
-**v1.3.0** — released 2026-05-21
+**v1.3.1** — released 2026-05-22
 Copyright (c) Viking Li &lt;viking.li@walmart.com&gt;
 
 A stand-alone Python 3 monitoring tool that repeatedly probes HTTP/HTTPS
@@ -25,9 +25,9 @@ Uses only the Python standard library. No `pip install` required.
   spikes are flagged inline and tabled in the summary.
 - **Traceroute path tracking** — background worker per host runs
   `traceroute` / `tracert` on an interval and records hop-path changes.
-  Memory-bounded: up to **6 path snapshots** (initial + latest always
-  preserved) and the **10 most recent full-path changes** are kept per
-  host.
+  Up to **8 path snapshots** are kept per host (initial + latest always
+  preserved); **every** path change is recorded in a compact
+  one-line-per-change history with a brief hop-level diff.
 - **Three output streams** — terminal, `log.txt`, and `summary.txt`,
   all carrying the version and copyright headers.
 
@@ -141,7 +141,7 @@ https://internal.service.local:8443/status
 
 ```
 ============================================================
-HTTP/HTTPS Monitor v1.3.0  (released 2026-05-21)
+HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 Run started: 2026-05-21T15:47:16
 ============================================================
@@ -182,7 +182,7 @@ Tab-separated, one row per request, plus annotated event lines:
 
 ```
 # HTTP monitor log — started 2026-05-21T15:47:16
-# HTTP/HTTPS Monitor v1.3.0  (released 2026-05-21)
+# HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
 # Copyright (c) Viking Li - viking.li@walmart.com
 # timestamp	status	latency_ms	ip	url	detail
 2026-05-21T15:47:16.789	200	596.1	142.251.154.119	https://www.google.com	
@@ -203,22 +203,21 @@ Sections, written on exit:
 4. **Latency Anomaly Log** — one ASCII table per URL listing baseline,
    observed, factor, and IP for each anomaly.
 5. **Traceroute Path Changes** — per URL/host:
-   - A **Path snapshots** table (up to 6 columns) showing each retained
+   - A **Path snapshots** table (up to 8 columns) showing each retained
      snapshot side-by-side with hop numbers as rows. The first column is
      always the initial path, the last column is always the latest path;
-     if more than 6 distinct snapshots are taken, the oldest intermediate
+     if more than 8 distinct snapshots are taken, the oldest intermediate
      ones are dropped while initial and latest are preserved.
-   - A **Change history** section listing up to 10 most recent path
-     changes, each rendered as its own `Hop | Old | New | Δ` table with
-     a brief diff line. When more than 10 changes occur, the oldest are
-     dropped.
+   - A **Change history** section listing every path change observed as
+     one compact line — `#N timestamp (oldhops -> newhops) hopX: a->b; ...`
+     — with no per-change tables. Uncapped.
    - An **Errors** table with the last 5 traceroute errors (if any).
 
 Truncated example:
 
 ```
 HTTP/HTTPS Monitor Summary
-HTTP/HTTPS Monitor v1.3.0  (released 2026-05-21)
+HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 ============================================================
 Started : 2026-05-21T15:47:16
@@ -256,28 +255,20 @@ URL: https://httpbin.org  (3 change(s))
 Traceroute Path Changes
 ------------------------------------------------------------
 URL: https://example.test/  (host: example.test, runs: 13, path changes: 11, errors: 0)
-  Path snapshots (keeping 6 of 12; initial + latest always preserved):
-+-----+------------+----------+-----------+-----------+----------+-----------+
-| Hop | #1 initial | #2       | #3        | #4        | #5       | #6 latest |
-|     | 15:00:00   | 15:08:00 | 15:09:00  | 15:10:00  | 15:11:00 | 15:12:00  |
-+-----+------------+----------+-----------+-----------+----------+-----------+
-| 1   | 10.0.0.1   | 10.0.0.1 | 10.0.0.1  | 10.0.0.1  | 10.0.0.1 | 10.0.0.1  |
-| 2   | 10.0.0.2   | 10.0.0.2 | 10.0.0.55 | 10.0.0.42 | 10.0.0.2 | 10.0.0.55 |
-| 3   | 10.0.0.3   | 10.0.0.3 | 10.0.0.66 | 10.0.0.3  | 10.0.0.3 | 10.0.0.66 |
-| 4   | 10.0.0.4   | 10.0.0.4 | 10.0.0.77 | 10.0.0.99 | 10.0.0.4 | 10.0.0.77 |
-+-----+------------+----------+-----------+-----------+----------+-----------+
-  Change history (showing 10 most recent of 11 total):
-    #1  2026-05-21T15:02:00.000  (5 -> 5 hops)  hop3: 10.0.0.99->10.0.0.3
-+-----+-----------+----------+---+
-| Hop | Old       | New      | Δ |
-+-----+-----------+----------+---+
-| 1   | 10.0.0.1  | 10.0.0.1 |   |
-| 2   | 10.0.0.2  | 10.0.0.2 |   |
-| 3   | 10.0.0.99 | 10.0.0.3 | * |
-| 4   | 10.0.0.4  | 10.0.0.4 |   |
-| 5   | 10.0.0.5  | 10.0.0.5 |   |
-+-----+-----------+----------+---+
-    ... (up to 10 entries)
+  Path snapshots (keeping 8 of 12; initial + latest always preserved):
++-----+------------+-----------+----------+----------+-----------+-----------+----------+-----------+
+| Hop | #1 initial | #2        | #3       | #4       | #5        | #6        | #7       | #8 latest |
+|     | 15:00:00   | 15:06:00  | 15:07:00 | 15:08:00 | 15:09:00  | 15:10:00  | 15:11:00 | 15:12:00  |
++-----+------------+-----------+----------+----------+-----------+-----------+----------+-----------+
+| 1   | 10.0.0.1   | 10.0.0.1  | 10.0.0.1 | 10.0.0.1 | 10.0.0.1  | 10.0.0.1  | 10.0.0.1 | 10.0.0.1  |
+| 2   | 10.0.0.2   | 10.0.0.2  | 10.0.0.2 | 10.0.0.2 | 10.0.0.55 | 10.0.0.42 | 10.0.0.2 | 10.0.0.55 |
+| 3   | 10.0.0.3   | 10.0.0.99 | 10.0.0.3 | 10.0.0.3 | 10.0.0.66 | 10.0.0.3  | 10.0.0.3 | 10.0.0.66 |
++-----+------------+-----------+----------+----------+-----------+-----------+----------+-----------+
+  Change history (11):
+    #1  2026-05-22T15:01:00.000  (5 -> 5 hops)  hop3: 10.0.0.3->10.0.0.99
+    #2  2026-05-22T15:02:00.000  (5 -> 5 hops)  hop3: 10.0.0.99->10.0.0.3
+    #3  2026-05-22T15:04:00.000  (5 -> 5 hops)  hop2: 10.0.0.2->10.0.0.42
+    ... (one compact line per path change, no cap)
 ```
 
 ---

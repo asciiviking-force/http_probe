@@ -18,12 +18,14 @@ Copyright (c) Viking Li <viking.li@walmart.com>. All rights reserved.
 
 __author__ = "Viking Li <viking.li@walmart.com>"
 __copyright__ = "Copyright (c) Viking Li <viking.li@walmart.com>"
-__version__ = "1.3.0"
-__date__ = "2026-05-21"
+__version__ = "1.3.1"
+__date__ = "2026-05-22"
 
-# Bookkeeping caps for tracert state. See tracert_worker / write_summary.
-TRACERT_SNAPSHOT_CAP = 6     # snapshots retained per host (initial + latest always preserved)
-TRACERT_CHANGE_CAP = 10      # path-change history entries retained per host
+# Bookkeeping cap for tracert state. See tracert_worker / write_summary.
+TRACERT_SNAPSHOT_CAP = 8     # snapshots retained per host (initial + latest always preserved)
+# Change-history list is uncapped — every path change is recorded with full
+# old/new hop sequences. On very long runs this grows linearly with the
+# number of path changes; that's an accepted trade-off for full audit fidelity.
 COPYRIGHT_NOTICE = "Copyright (c) Viking Li - viking.li@walmart.com"
 VERSION_BANNER = f"HTTP/HTTPS Monitor v{__version__}  (released {__date__})"
 
@@ -250,10 +252,8 @@ def tracert_worker(host, interval, max_hops, timeout, base_cmd,
                            f"{len(hops)} hop(s): {' -> '.join(hops)}")
                 elif last_hops != hops:
                     entry["total_changes"] += 1
-                    # Append full-path change; cap history.
+                    # Append full-path change (uncapped — keep entire history).
                     entry["changes"].append((ts, last_hops, hops))
-                    if len(entry["changes"]) > TRACERT_CHANGE_CAP:
-                        entry["changes"].pop(0)
                     # Append snapshot; cap by dropping the oldest non-initial
                     # entry so snapshots[0] (initial) and snapshots[-1] (latest)
                     # remain preserved.
@@ -550,29 +550,15 @@ def write_summary(path, urls, stats, changes, latency_events, tracert_state,
                 lines.append("  Current path:")
                 lines.extend(_render_table(["Hop", "IP"], body))
 
-            # ---- Path change history (full hops, up to TRACERT_CHANGE_CAP)
+            # ---- Path change history (compact one-line entries) ------
             if ch:
-                kept_ch = len(ch)
-                if total_changes > kept_ch:
-                    lines.append(
-                        f"  Change history (showing {kept_ch} most recent of "
-                        f"{total_changes} total):")
-                else:
-                    lines.append(f"  Change history ({kept_ch}):")
+                lines.append(f"  Change history ({len(ch)}):")
                 for idx, (ts, prev_hops, curr_hops) in enumerate(ch, start=1):
                     diff_desc = _hops_diff_brief(prev_hops, curr_hops)
                     lines.append(
-                        f"    #{idx}  {ts}  ({len(prev_hops)} -> {len(curr_hops)} hops)  "
+                        f"    #{idx}  {ts}  "
+                        f"({len(prev_hops)} -> {len(curr_hops)} hops)  "
                         f"{diff_desc}")
-                    max_len = max(len(prev_hops), len(curr_hops))
-                    body = []
-                    for i in range(max_len):
-                        o = prev_hops[i] if i < len(prev_hops) else "-"
-                        n = curr_hops[i] if i < len(curr_hops) else "-"
-                        marker = "*" if o != n else ""
-                        body.append([str(i + 1), o, n, marker])
-                    lines.extend(_render_table(
-                        ["Hop", "Old", "New", "Δ"], body))
 
             # Error table (last 5).
             if errs:
