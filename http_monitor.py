@@ -18,8 +18,12 @@ Copyright (c) Viking Li <viking.li@walmart.com>. All rights reserved.
 
 __author__ = "Viking Li <viking.li@walmart.com>"
 __copyright__ = "Copyright (c) Viking Li <viking.li@walmart.com>"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __date__ = "2026-05-21"
+
+# Bookkeeping caps for tracert state. See tracert_worker / write_summary.
+TRACERT_SNAPSHOT_CAP = 6     # snapshots retained per host (initial + latest always preserved)
+TRACERT_CHANGE_CAP = 10      # path-change history entries retained per host
 COPYRIGHT_NOTICE = "Copyright (c) Viking Li - viking.li@walmart.com"
 VERSION_BANNER = f"HTTP/HTTPS Monitor v{__version__}  (released {__date__})"
 
@@ -241,10 +245,21 @@ def tracert_worker(host, interval, max_hops, timeout, base_cmd,
                 entry["runs"] += 1
                 if last_hops is None:
                     entry["initial"] = hops
+                    entry["snapshots"].append((ts, hops))
                     msg = (f"[{ts}] TRACERT {host:<30} INITIAL "
                            f"{len(hops)} hop(s): {' -> '.join(hops)}")
                 elif last_hops != hops:
+                    entry["total_changes"] += 1
+                    # Append full-path change; cap history.
                     entry["changes"].append((ts, last_hops, hops))
+                    if len(entry["changes"]) > TRACERT_CHANGE_CAP:
+                        entry["changes"].pop(0)
+                    # Append snapshot; cap by dropping the oldest non-initial
+                    # entry so snapshots[0] (initial) and snapshots[-1] (latest)
+                    # remain preserved.
+                    entry["snapshots"].append((ts, hops))
+                    if len(entry["snapshots"]) > TRACERT_SNAPSHOT_CAP:
+                        entry["snapshots"].pop(1)
                     diff_desc = _hops_diff_brief(last_hops, hops)
                     msg = (f"[{ts}] TRACERT {host:<30} *PATH CHANGE* {diff_desc}")
                 else:
@@ -331,6 +346,67 @@ def _render_table(headers, body):
             str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |"
 
     out = [sep, fmt(headers), sep]
+    out.extend(fmt(row) for row in body)
+    out.append(sep)
+    return out
+
+
+def _render_snapshots_table(snaps):
+    """Render up to N path snapshots side-by-side.
+
+    `snaps` is a list of (timestamp, hops) tuples with snaps[0]=initial,
+    snaps[-1]=latest. Each snapshot becomes a column; rows are hop indices.
+    The header row carries the snapshot label, the second row its short
+    timestamp (HH:MM:SS).
+    """
+    if not snaps:
+        return []
+    n = len(snaps)
+    # Column 0 = Hop number; columns 1..n = snapshots.
+    # Build two-line headers.
+    labels = []
+    times = []
+    for idx, (ts, _) in enumerate(snaps, start=1):
+        if idx == 1 and n > 1:
+            labels.append(f"#{idx} initial")
+        elif idx == n and n > 1:
+            labels.append(f"#{idx} latest")
+        elif n == 1:
+            labels.append(f"#{idx} initial=latest")
+        else:
+            labels.append(f"#{idx}")
+        # Keep just the HH:MM:SS portion of the ISO timestamp for narrowness.
+        try:
+            times.append(ts.split("T", 1)[1].split(".", 1)[0])
+        except (IndexError, AttributeError):
+            times.append(str(ts))
+
+    max_hops = max(len(h) for _, h in snaps)
+    # Build cell grid: each row = hop number then one cell per snapshot.
+    body = []
+    for i in range(max_hops):
+        row = [str(i + 1)]
+        for _, hops in snaps:
+            row.append(hops[i] if i < len(hops) else "-")
+        body.append(row)
+
+    # Compute column widths.
+    headers_top = ["Hop"] + labels
+    headers_bot = [""] + times
+    widths = [len(h) for h in headers_top]
+    for i, h in enumerate(headers_bot):
+        widths[i] = max(widths[i], len(h))
+    for row in body:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    def fmt(row):
+        return "| " + " | ".join(
+            str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |"
+
+    out = [sep, fmt(headers_top), fmt(headers_bot), sep]
     out.extend(fmt(row) for row in body)
     out.append(sep)
     return out
@@ -443,43 +519,60 @@ def write_summary(path, urls, stats, changes, latency_events, tracert_state,
             entry = tracert_state[host]
             initial = entry.get("initial") or []
             latest = entry.get("latest") or []
+            snaps = entry.get("snapshots", [])
             ch = entry.get("changes", [])
             errs = entry.get("errors", [])
             runs = entry.get("runs", 0)
-            if not (initial or latest or ch or errs):
+            total_changes = entry.get("total_changes", 0)
+            # Total snapshots observed over the run = 1 (initial) + every change.
+            total_snaps_taken = (1 if initial else 0) + total_changes
+            if not (initial or latest or snaps or ch or errs):
                 continue
             any_data = True
-            lines.append(f"URL: {url}  (host: {host}, runs: {runs}, "
-                         f"changes: {len(ch)}, errors: {len(errs)})")
+            lines.append(
+                f"URL: {url}  (host: {host}, runs: {runs}, "
+                f"path changes: {total_changes}, errors: {len(errs)})")
 
-            # Current-path table: hop-by-hop, with Initial vs Latest if differ.
-            if initial or latest:
-                show_both = bool(initial) and bool(latest) and initial != latest
-                if show_both:
-                    max_len = max(len(initial), len(latest))
+            # ---- Path snapshots (up to TRACERT_SNAPSHOT_CAP) -------------
+            if snaps:
+                kept = len(snaps)
+                if total_snaps_taken > kept:
+                    lines.append(
+                        f"  Path snapshots (keeping {kept} of {total_snaps_taken}; "
+                        f"initial + latest always preserved):")
+                else:
+                    lines.append(f"  Path snapshots ({kept}):")
+                lines.extend(_render_snapshots_table(snaps))
+            elif initial or latest:
+                # Fallback if snapshots somehow empty but initial/latest exist.
+                cur_path = latest or initial
+                body = [[str(i + 1), hop] for i, hop in enumerate(cur_path)]
+                lines.append("  Current path:")
+                lines.extend(_render_table(["Hop", "IP"], body))
+
+            # ---- Path change history (full hops, up to TRACERT_CHANGE_CAP)
+            if ch:
+                kept_ch = len(ch)
+                if total_changes > kept_ch:
+                    lines.append(
+                        f"  Change history (showing {kept_ch} most recent of "
+                        f"{total_changes} total):")
+                else:
+                    lines.append(f"  Change history ({kept_ch}):")
+                for idx, (ts, prev_hops, curr_hops) in enumerate(ch, start=1):
+                    diff_desc = _hops_diff_brief(prev_hops, curr_hops)
+                    lines.append(
+                        f"    #{idx}  {ts}  ({len(prev_hops)} -> {len(curr_hops)} hops)  "
+                        f"{diff_desc}")
+                    max_len = max(len(prev_hops), len(curr_hops))
                     body = []
                     for i in range(max_len):
-                        o = initial[i] if i < len(initial) else "-"
-                        n = latest[i] if i < len(latest) else "-"
+                        o = prev_hops[i] if i < len(prev_hops) else "-"
+                        n = curr_hops[i] if i < len(curr_hops) else "-"
                         marker = "*" if o != n else ""
                         body.append([str(i + 1), o, n, marker])
-                    lines.append("  Path (initial vs latest):")
                     lines.extend(_render_table(
-                        ["Hop", "Initial", "Latest", "Δ"], body))
-                else:
-                    cur_path = latest or initial
-                    body = [[str(i + 1), hop] for i, hop in enumerate(cur_path)]
-                    lines.append("  Current path:")
-                    lines.extend(_render_table(["Hop", "IP"], body))
-
-            # Path-change history table.
-            if ch:
-                lines.append(f"  Change history ({len(ch)}):")
-                body = [[ts, _hops_diff_brief(prev, curr),
-                         f"{len(prev)}", f"{len(curr)}"]
-                        for ts, prev, curr in ch]
-                lines.extend(_render_table(
-                    ["Timestamp", "Diff", "Old hops", "New hops"], body))
+                        ["Hop", "Old", "New", "Δ"], body))
 
             # Error table (last 5).
             if errs:
@@ -584,7 +677,9 @@ def main():
                     unique_hosts.append(h)
             for h in unique_hosts:
                 tracert_state[h] = {"initial": None, "latest": None,
-                                    "changes": [], "errors": [], "runs": 0}
+                                    "snapshots": [],
+                                    "changes": [], "errors": [], "runs": 0,
+                                    "total_changes": 0}
 
     print("=" * 60)
     print(VERSION_BANNER)
@@ -738,9 +833,11 @@ def main():
             tracert_snapshot = {
                 h: {"initial": v.get("initial"),
                     "latest": v.get("latest"),
+                    "snapshots": list(v.get("snapshots", [])),
                     "changes": list(v.get("changes", [])),
                     "errors": list(v.get("errors", [])),
-                    "runs": v.get("runs", 0)}
+                    "runs": v.get("runs", 0),
+                    "total_changes": v.get("total_changes", 0)}
                 for h, v in tracert_state.items()}
         write_summary(args.summary, urls, stats, changes,
                       latency_events, tracert_snapshot, url_hosts,

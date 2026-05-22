@@ -2,38 +2,47 @@ HTTP/HTTPS Monitor Summary
 HTTP/HTTPS Monitor v1.2.0  (released 2026-05-21)
 Copyright (c) Viking Li - viking.li@walmart.com
 ============================================================
-Started : 2026-05-21T16:15:49
-Ended   : 2026-05-21T16:15:59
-Duration: 10.29s
-Total requests: 12
+Started : 2026-05-21T16:26:59
+Ended   : 2026-05-21T16:27:05
+Duration: 5.69s
+Total requests: 6
 
 Per-URL Statistics
 ------------------------------------------------------------
 https://www.google.com
-  total       : 6
-  success     : 6  (100.00%)
+  total       : 3
+  success     : 3  (100.00%)
   failure     : 0
-  latency ms  : avg=595.1  min=573.1  max=639.8
-  percentiles : p50=589.8  p95=631.0  p99=638.0  (n=6)
+  latency ms  : avg=632.0  min=604.1  max=663.9
+  percentiles : p50=628.0  p95=660.3  p99=663.2  (n=3)
   status code breakdown:
-    200      : 6
+    200      : 3
   resolved IP breakdown:
-    142.251.150.119 : 6
+    142.251.153.119 : 1
+    142.251.155.119 : 1
+    142.251.157.119 : 1
 
 https://www.cisco.com
-  total       : 6
-  success     : 6  (100.00%)
+  total       : 3
+  success     : 3  (100.00%)
   failure     : 0
-  latency ms  : avg=816.2  min=781.7  max=856.0
-  percentiles : p50=811.6  p95=852.2  p99=855.2  (n=6)
+  latency ms  : avg=855.2  min=840.4  max=880.2
+  percentiles : p50=844.9  p95=876.7  p99=879.5  (n=3)
   status code breakdown:
-    200      : 6
+    200      : 3
   resolved IP breakdown:
-    23.222.206.179  : 6
+    23.222.206.179  : 3
 
 Status Change Log
 ------------------------------------------------------------
-(no status / IP changes observed)
+URL: https://www.google.com  (2 change(s))
++-------------------------+------+-----------------+-----+-----------------+
+| Timestamp               | From | From IP         | To  | To IP           |
++-------------------------+------+-----------------+-----+-----------------+
+| 2026-05-21T16:27:02.134 | 200  | 142.251.153.119 | 200 | 142.251.155.119 |
+| 2026-05-21T16:27:04.060 | 200  | 142.251.155.119 | 200 | 142.251.157.119 |
++-------------------------+------+-----------------+-----+-----------------+
+
 
 Latency Anomaly Log
 ------------------------------------------------------------
