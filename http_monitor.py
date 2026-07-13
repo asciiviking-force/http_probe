@@ -8,17 +8,21 @@ status-change log plus per-URL statistics to summary.txt on exit.
 
 Uses only the Python standard library — no external dependencies.
 
+Optionally runs background traceroute and ICMP-ping probes per host (via the
+system binaries — no raw sockets / root needed).
+
 Examples:
     python3 http_monitor.py -u https://example.com -i 2
     python3 http_monitor.py -f url.txt -i 1 -c 100
     python3 http_monitor.py -u https://a.com -u https://b.com -i 5
+    python3 http_monitor.py -f url.txt --ping-interval 2 --tracert-interval 60
 
 Copyright (c) Viking Li <viking.li@walmart.com>. All rights reserved.
 """
 
 __author__ = "Viking Li <viking.li@walmart.com>"
 __copyright__ = "Copyright (c) Viking Li <viking.li@walmart.com>"
-__version__ = "1.3.1"
+__version__ = "1.4.1"
 __date__ = "2026-05-22"
 
 # Bookkeeping cap for tracert state. See tracert_worker / write_summary.
@@ -296,6 +300,161 @@ def _hops_diff_brief(old, new):
     return "; ".join(diffs)
 
 
+# ---------------------------------------------------------------------------
+# ICMP ping (via the system `ping` binary — no raw sockets / root needed).
+# ---------------------------------------------------------------------------
+_PING_RTT_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
+_PING_TTL_RE = re.compile(r"ttl[=]?\s*(\d+)", re.IGNORECASE)
+
+
+def find_ping_cmd():
+    """Return a ping 'mode' string for this platform, or None if no binary.
+
+    Modes: 'win' (Windows), 'darwin' (macOS), 'unix' (Linux/other).
+    """
+    if not shutil.which("ping"):
+        return None
+    if sys.platform.startswith("win"):
+        return "win"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "unix"
+
+
+def run_ping(host, timeout, mode):
+    """Send a single ICMP echo. Returns (rtt_ms_or_None, ttl_or_None, error).
+
+    - rtt is None on packet loss.
+    - error is set only on a command-level failure (binary missing, unknown
+      host, subprocess error), NOT on ordinary packet loss.
+
+    Flag semantics differ per platform:
+      macOS   ping -c 1 -W <ms>   (-W = per-reply wait in milliseconds)
+      Linux   ping -c 1 -W <sec>  (-W = per-reply wait in whole seconds)
+      Windows ping -n 1 -w <ms>   (-w = per-reply wait in milliseconds)
+    """
+    if mode is None:
+        return None, None, "ping binary not found"
+    if mode == "win":
+        cmd = ["ping", "-n", "1", "-w", str(int(max(1, timeout * 1000))), host]
+    elif mode == "darwin":
+        cmd = ["ping", "-c", "1", "-W", str(int(max(1, timeout * 1000))), host]
+    else:  # unix / linux
+        cmd = ["ping", "-c", "1", "-W", str(int(max(1, round(timeout)))), host]
+    # Hard backstop a little beyond the per-reply wait.
+    hard = timeout + 3.0
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=hard)
+    except subprocess.TimeoutExpired:
+        return None, None, None  # treat as loss (no reply within budget)
+    except FileNotFoundError as exc:
+        return None, None, f"ping binary missing: {exc}"
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    rtt_m = _PING_RTT_RE.search(text)
+    if rtt_m:
+        rtt = float(rtt_m.group(1))
+        ttl_m = _PING_TTL_RE.search(text)
+        ttl = int(ttl_m.group(1)) if ttl_m else None
+        return rtt, ttl, None
+    # No RTT -> loss or hard error. Distinguish resolution failures.
+    low = text.lower()
+    if ("unknown host" in low or "cannot resolve" in low
+            or "name or service not known" in low
+            or "could not find host" in low):
+        return None, None, "unknown host"
+    # Ordinary packet loss (100% loss / timeout). Not an error.
+    return None, None, None
+
+
+def ping_worker(host, interval, timeout, mode,
+                ping_state, lock, stop_event, log_f, log_lock):
+    """Periodically ICMP-ping `host`, recording RTT / loss / TTL changes.
+
+    Terminal output is intentionally quiet: it only announces the first loss
+    of a streak, recovery, TTL changes, and hard errors. Every result is
+    written to the log file as a `# ping` event line.
+    """
+    while not stop_event.is_set():
+        rtt, ttl, err = run_ping(host, timeout, mode)
+        now_dt = datetime.now()
+        ts = now_dt.isoformat(timespec="milliseconds")
+        msg = None
+        with lock:
+            entry = ping_state[host]
+            entry["sent"] += 1
+            if err:
+                entry["errors"].append((ts, err))
+                entry["lost"] += 1
+                entry["consecutive_losses"] += 1
+                entry["max_consecutive_losses"] = max(
+                    entry["max_consecutive_losses"], entry["consecutive_losses"])
+                msg = f"[{ts}] PING    {host:<30} ERROR  {err}"
+                log_kind, log_val = "ERROR", err
+                cur_reach, reach_detail = "DOWN", f"error: {err}"
+            elif rtt is None:
+                entry["lost"] += 1
+                entry["consecutive_losses"] += 1
+                entry["max_consecutive_losses"] = max(
+                    entry["max_consecutive_losses"], entry["consecutive_losses"])
+                # Only announce the first loss of a streak on the terminal.
+                if entry["consecutive_losses"] == 1:
+                    msg = f"[{ts}] PING    {host:<30} *LOSS*  (no reply)"
+                log_kind, log_val = "LOSS", ""
+                cur_reach, reach_detail = "DOWN", "no reply"
+            else:
+                prev_streak = entry["consecutive_losses"]
+                entry["consecutive_losses"] = 0
+                entry["recv"] += 1
+                entry["rtt_total"] += rtt
+                entry["rtt_min"] = min(entry["rtt_min"], rtt)
+                entry["rtt_max"] = max(entry["rtt_max"], rtt)
+                entry["rtts"].append(rtt)
+                if ttl is not None:
+                    entry["ttls"][ttl] += 1
+                    if entry["last_ttl"] is not None and entry["last_ttl"] != ttl:
+                        entry["ttl_changes"].append((ts, entry["last_ttl"], ttl))
+                        msg = (f"[{ts}] PING    {host:<30} *TTL CHANGE* "
+                               f"{entry['last_ttl']} -> {ttl}  rtt={rtt:.1f}ms")
+                    entry["last_ttl"] = ttl
+                # Recovery announcement after a loss streak (unless TTL already spoke).
+                if prev_streak > 0 and msg is None:
+                    msg = (f"[{ts}] PING    {host:<30} RECOVERED after "
+                           f"{prev_streak} lost  rtt={rtt:.1f}ms"
+                           + (f" ttl={ttl}" if ttl is not None else ""))
+                log_kind = "OK"
+                log_val = (f"rtt={rtt:.1f}ms"
+                           + (f" ttl={ttl}" if ttl is not None else ""))
+                cur_reach = "UP"
+                reach_detail = (f"rtt={rtt:.1f}ms"
+                                + (f" ttl={ttl}" if ttl is not None else ""))
+
+            # Reachability (UP<->DOWN) transition tracking, mirroring the URL
+            # status-change log. The first probe just sets the baseline state.
+            prev_reach = entry["reach_state"]
+            if prev_reach is None:
+                entry["reach_state"] = cur_reach
+                entry["reach_since"] = now_dt
+            elif prev_reach != cur_reach:
+                prev_lasted = (now_dt - entry["reach_since"]).total_seconds()
+                entry["reach_changes"].append(
+                    (ts, prev_reach, cur_reach, prev_lasted, reach_detail))
+                entry["reach_state"] = cur_reach
+                entry["reach_since"] = now_dt
+        if msg:
+            print(msg)
+        with log_lock:
+            log_f.write(f"# ping\t{ts}\t{host}\t{log_kind}\t{log_val}\n")
+        # Sleep with responsiveness to stop signal.
+        slept = 0.0
+        while slept < interval and not stop_event.is_set():
+            chunk = min(0.5, interval - slept)
+            time.sleep(chunk)
+            slept += chunk
+
+
 def percentile(sorted_values, p):
     if not sorted_values:
         return 0.0
@@ -413,7 +572,7 @@ def _render_snapshots_table(snaps):
 
 
 def write_summary(path, urls, stats, changes, latency_events, tracert_state,
-                  url_hosts, started_at, ended_at, total_requests):
+                  ping_state, url_hosts, started_at, ended_at, total_requests):
     lines = []
     lines.append("HTTP/HTTPS Monitor Summary")
     lines.append(VERSION_BANNER)
@@ -571,6 +730,73 @@ def write_summary(path, urls, stats, changes, latency_events, tracert_state,
             lines.append("(no traceroute results yet)")
     lines.append("")
 
+    # -- ICMP ping statistics -----------------------------------------------
+    lines.append("Per-Host ICMP Ping")
+    lines.append("-" * 60)
+    if not ping_state:
+        lines.append("(icmp ping disabled)")
+    else:
+        any_ping = False
+        for url in urls:
+            host = url_hosts.get(url)
+            if not host or host not in ping_state:
+                continue
+            p = ping_state[host]
+            sent = p.get("sent", 0)
+            if sent == 0:
+                continue
+            any_ping = True
+            recv = p.get("recv", 0)
+            lost = p.get("lost", 0)
+            loss_pct = (lost / sent * 100) if sent else 0.0
+            lines.append(
+                f"URL: {url}  (host: {host})")
+            lines.append(
+                f"  sent={sent}  recv={recv}  lost={lost}  "
+                f"({loss_pct:.2f}% loss)  "
+                f"max consecutive loss={p.get('max_consecutive_losses', 0)}")
+            # Reachability (UP<->DOWN) change table, mirroring the URL log.
+            reach_changes = p.get("reach_changes", [])
+            if reach_changes:
+                lines.append(f"  Reachability changes ({len(reach_changes)}):")
+                body = [[ts, frm, to, f"{dur:.1f}s", detail]
+                        for ts, frm, to, dur, detail in reach_changes]
+                lines.extend(_render_table(
+                    ["Timestamp", "From", "To", "Prev lasted", "Detail"], body))
+            if recv > 0:
+                avg = p["rtt_total"] / recv
+                lines.append(
+                    f"  rtt ms      : min={p['rtt_min']:.1f}  "
+                    f"avg={avg:.1f}  max={p['rtt_max']:.1f}")
+                samples = sorted(p.get("rtts", []))
+                if samples:
+                    lines.append(
+                        f"  percentiles : p50={percentile(samples, 50):.1f}  "
+                        f"p95={percentile(samples, 95):.1f}  "
+                        f"p99={percentile(samples, 99):.1f}  (n={len(samples)})")
+            else:
+                lines.append("  rtt ms      : (no replies)")
+            ttls = p.get("ttls", {})
+            if ttls:
+                lines.append("  TTL breakdown:")
+                for ttl in sorted(ttls):
+                    lines.append(f"    {ttl:<5} : {ttls[ttl]}")
+            ttl_changes = p.get("ttl_changes", [])
+            if ttl_changes:
+                lines.append(f"  TTL changes ({len(ttl_changes)}):")
+                body = [[ts, str(old), str(new)] for ts, old, new in ttl_changes]
+                lines.extend(_render_table(
+                    ["Timestamp", "Old TTL", "New TTL"], body))
+            errs = p.get("errors", [])
+            if errs:
+                lines.append(f"  Errors (last {min(5, len(errs))} of {len(errs)}):")
+                body = [[ts, err] for ts, err in errs[-5:]]
+                lines.extend(_render_table(["Timestamp", "Error"], body))
+            lines.append("")
+        if not any_ping:
+            lines.append("(no ping results yet)")
+    lines.append("")
+
     Path(path).write_text("\n".join(lines))
 
 
@@ -609,6 +835,11 @@ def main():
                         help="Maximum traceroute hops (default: 20).")
     parser.add_argument("--tracert-timeout", type=float, default=30.0,
                         help="Per-run traceroute timeout in seconds (default: 30).")
+    parser.add_argument("--ping-interval", type=float, default=0.0,
+                        help="ICMP-ping each host every N seconds "
+                             "(default: 0 = disabled; suggested: 1-5).")
+    parser.add_argument("--ping-timeout", type=float, default=2.0,
+                        help="Per-ping reply wait in seconds (default: 2).")
     args = parser.parse_args()
 
     if args.interval < 0:
@@ -643,6 +874,14 @@ def main():
         if h:
             url_hosts[u] = h
 
+    # Unique hosts, preserving first-seen order (shared by tracert + ping).
+    unique_hosts = []
+    seen_hosts = set()
+    for h in url_hosts.values():
+        if h not in seen_hosts:
+            seen_hosts.add(h)
+            unique_hosts.append(h)
+
     # Set up tracert workers (one per unique host) if enabled.
     tracert_state = {}
     tracert_threads = []
@@ -655,17 +894,34 @@ def main():
             print("WARNING: traceroute/tracert binary not found — "
                   "path tracking disabled.")
         else:
-            unique_hosts = []
-            seen_hosts = set()
-            for h in url_hosts.values():
-                if h not in seen_hosts:
-                    seen_hosts.add(h)
-                    unique_hosts.append(h)
             for h in unique_hosts:
                 tracert_state[h] = {"initial": None, "latest": None,
                                     "snapshots": [],
                                     "changes": [], "errors": [], "runs": 0,
                                     "total_changes": 0}
+
+    # Set up ping workers (one per unique host) if enabled.
+    ping_state = {}
+    ping_threads = []
+    ping_stop = threading.Event()
+    ping_lock = threading.Lock()
+    ping_mode = None
+    if args.ping_interval > 0:
+        ping_mode = find_ping_cmd()
+        if ping_mode is None:
+            print("WARNING: ping binary not found — ICMP ping disabled.")
+        else:
+            for h in unique_hosts:
+                ping_state[h] = {"sent": 0, "recv": 0, "lost": 0,
+                                 "rtts": [], "rtt_total": 0.0,
+                                 "rtt_min": float("inf"), "rtt_max": 0.0,
+                                 "ttls": defaultdict(int), "last_ttl": None,
+                                 "ttl_changes": [],
+                                 "consecutive_losses": 0,
+                                 "max_consecutive_losses": 0,
+                                 "reach_state": None, "reach_since": None,
+                                 "reach_changes": [],
+                                 "errors": []}
 
     print("=" * 60)
     print(VERSION_BANNER)
@@ -679,13 +935,16 @@ def main():
     if tracert_state:
         print(f"Tracert: every {args.tracert_interval}s for "
               f"{len(tracert_state)} host(s) (max {args.tracert_max_hops} hops)")
+    if ping_state:
+        print(f"ICMP ping: every {args.ping_interval}s for "
+              f"{len(ping_state)} host(s) (wait {args.ping_timeout}s)")
 
     log_f = open(args.log, "w", buffering=1)
     log_f.write(f"# HTTP monitor log — started {started_at.isoformat(timespec='seconds')}\n")
     log_f.write(f"# {VERSION_BANNER}\n")
     log_f.write(f"# {COPYRIGHT_NOTICE}\n")
     log_f.write("# Per-request rows:  timestamp\\tstatus\\tlatency_ms\\tip\\turl\\tdetail\n")
-    log_f.write("# Event lines start with '# latency' or '# tracert'.\n")
+    log_f.write("# Event lines start with '# latency', '# tracert', or '# ping'.\n")
     log_f.write("# timestamp\tstatus\tlatency_ms\tip\turl\tdetail\n")
 
     # Now that log_f exists, start tracert workers.
@@ -701,6 +960,17 @@ def main():
                 name=f"tracert-{h}", daemon=True)
             t.start()
             tracert_threads.append(t)
+
+    # Start ping workers.
+    if ping_state:
+        for h in ping_state.keys():
+            t = threading.Thread(
+                target=ping_worker,
+                args=(h, args.ping_interval, args.ping_timeout, ping_mode,
+                      ping_state, ping_lock, ping_stop, log_f, log_lock),
+                name=f"ping-{h}", daemon=True)
+            t.start()
+            ping_threads.append(t)
 
     stop = {"flag": False}
 
@@ -807,9 +1077,12 @@ def main():
                     remaining -= chunk
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-        # Signal tracert workers and give them a moment to exit cleanly.
+        # Signal background workers and give them a moment to exit cleanly.
         tracert_stop.set()
+        ping_stop.set()
         for t in tracert_threads:
+            t.join(timeout=2.0)
+        for t in ping_threads:
             t.join(timeout=2.0)
         with log_lock:
             log_f.close()
@@ -825,8 +1098,24 @@ def main():
                     "runs": v.get("runs", 0),
                     "total_changes": v.get("total_changes", 0)}
                 for h, v in tracert_state.items()}
+        # Snapshot ping state under the lock for a consistent summary.
+        with ping_lock:
+            ping_snapshot = {
+                h: {"sent": v.get("sent", 0), "recv": v.get("recv", 0),
+                    "lost": v.get("lost", 0),
+                    "rtts": list(v.get("rtts", [])),
+                    "rtt_total": v.get("rtt_total", 0.0),
+                    "rtt_min": v.get("rtt_min", float("inf")),
+                    "rtt_max": v.get("rtt_max", 0.0),
+                    "ttls": dict(v.get("ttls", {})),
+                    "last_ttl": v.get("last_ttl"),
+                    "ttl_changes": list(v.get("ttl_changes", [])),
+                    "reach_changes": list(v.get("reach_changes", [])),
+                    "max_consecutive_losses": v.get("max_consecutive_losses", 0),
+                    "errors": list(v.get("errors", []))}
+                for h, v in ping_state.items()}
         write_summary(args.summary, urls, stats, changes,
-                      latency_events, tracert_snapshot, url_hosts,
+                      latency_events, tracert_snapshot, ping_snapshot, url_hosts,
                       started_at, ended_at, total_requests)
         print(f"\nLog saved to {args.log}")
         print(f"Summary saved to {args.summary}")

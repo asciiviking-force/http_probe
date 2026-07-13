@@ -1,12 +1,13 @@
 # http_monitor
 
-**v1.3.1** — released 2026-05-22
+**v1.4.1** — released 2026-05-22
 Copyright (c) Viking Li &lt;viking.li@walmart.com&gt;
 
 A stand-alone Python 3 monitoring tool that repeatedly probes HTTP/HTTPS
-endpoints, classifies each outcome, detects latency anomalies, and tracks
-traceroute path changes — all written to a live terminal stream, a
-tab-separated per-request log, and a human-readable summary on exit.
+endpoints, classifies each outcome, detects latency anomalies, tracks
+traceroute path changes, and runs optional ICMP-ping probes — all written
+to a live terminal stream, a tab-separated per-request log, and a
+human-readable summary on exit.
 
 Uses only the Python standard library. No `pip install` required.
 
@@ -28,6 +29,11 @@ Uses only the Python standard library. No `pip install` required.
   Up to **8 path snapshots** are kept per host (initial + latest always
   preserved); **every** path change is recorded in a compact
   one-line-per-change history with a brief hop-level diff.
+- **ICMP ping** — optional background worker per host runs the system
+  `ping` binary on an interval (no root/raw sockets needed) and records
+  RTT (min/avg/max + p50/p95/p99), packet loss, max consecutive loss,
+  TTL breakdown, plus **reachability (UP↔DOWN) and TTL change tables**
+  — same style as the URL Status Change Log.
 - **Three output streams** — terminal, `log.txt`, and `summary.txt`,
   all carrying the version and copyright headers.
 
@@ -39,6 +45,9 @@ Uses only the Python standard library. No `pip install` required.
 - For optional traceroute tracking: `traceroute` on macOS/Linux or
   `tracert` on Windows must be present on `PATH`. ICMP-based traceroute
   may require elevated privileges on some systems.
+- For optional ICMP ping: the system `ping` binary must be on `PATH`
+  (present by default on macOS/Linux/Windows). It is normally setuid /
+  setcap, so **no root is required**.
 
 ---
 
@@ -133,6 +142,13 @@ https://internal.service.local:8443/status
 | `--tracert-max-hops N` | `20` | Max hops per traceroute run. |
 | `--tracert-timeout SECONDS` | `30` | Per-run timeout for the traceroute process. |
 
+### ICMP ping
+
+| Option | Default | Description |
+|---|---|---|
+| `--ping-interval SECONDS` | `0` (off) | ICMP-ping each host every N seconds. |
+| `--ping-timeout SECONDS` | `2` | Per-ping reply wait. |
+
 ---
 
 ## Outputs
@@ -141,7 +157,7 @@ https://internal.service.local:8443/status
 
 ```
 ============================================================
-HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
+HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 Run started: 2026-05-21T15:47:16
 ============================================================
@@ -182,14 +198,20 @@ Tab-separated, one row per request, plus annotated event lines:
 
 ```
 # HTTP monitor log — started 2026-05-21T15:47:16
-# HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
+# HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
 # Copyright (c) Viking Li - viking.li@walmart.com
 # timestamp	status	latency_ms	ip	url	detail
 2026-05-21T15:47:16.789	200	596.1	142.251.154.119	https://www.google.com	
 2026-05-21T15:47:17.763	200	1390.7	54.209.210.20	https://httpbin.org	
 # latency	2026-05-21T15:47:30.001	https://httpbin.org	baseline=1170.5ms	observed=2400.0ms	factor=2.05	ip=54.91.177.181
 # tracert	2026-05-21T15:48:16.000	httpbin.org	CHANGE	10.x -> 10.y -> 18.z -> ...
+# ping	2026-05-21T15:47:17.100	www.google.com	OK	rtt=12.4ms ttl=115
+# ping	2026-05-21T15:47:18.100	www.google.com	LOSS	
 ```
+
+Event line kinds: `# latency`, `# tracert`, and `# ping`. Ping lines are
+`# ping <ts> <host> <OK|LOSS|ERROR> <detail>` — one per ping (OK carries
+`rtt=..ms ttl=..`).
 
 ### summary.txt
 
@@ -212,12 +234,17 @@ Sections, written on exit:
      one compact line — `#N timestamp (oldhops -> newhops) hopX: a->b; ...`
      — with no per-change tables. Uncapped.
    - An **Errors** table with the last 5 traceroute errors (if any).
+6. **Per-Host ICMP Ping** — per URL/host: sent/recv/lost with loss %,
+   max consecutive loss, RTT min/avg/max, p50/p95/p99, a TTL breakdown,
+   and three ASCII tables — a **Reachability changes** table
+   (`Timestamp | From | To | Prev lasted | Detail`, one row per UP↔DOWN
+   transition), a **TTL changes** table, and an errors table (last 5).
 
 Truncated example:
 
 ```
 HTTP/HTTPS Monitor Summary
-HTTP/HTTPS Monitor v1.3.1  (released 2026-05-22)
+HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 ============================================================
 Started : 2026-05-21T15:47:16
@@ -269,6 +296,28 @@ URL: https://example.test/  (host: example.test, runs: 13, path changes: 11, err
     #2  2026-05-22T15:02:00.000  (5 -> 5 hops)  hop3: 10.0.0.99->10.0.0.3
     #3  2026-05-22T15:04:00.000  (5 -> 5 hops)  hop2: 10.0.0.2->10.0.0.42
     ... (one compact line per path change, no cap)
+
+Per-Host ICMP Ping
+------------------------------------------------------------
+URL: https://www.google.com  (host: www.google.com)
+  sent=60  recv=57  lost=3  (5.00% loss)  max consecutive loss=3
+  Reachability changes (2):
++-------------------------+------+------+-------------+--------------------+
+| Timestamp               | From | To   | Prev lasted | Detail             |
++-------------------------+------+------+-------------+--------------------+
+| 2026-05-21T15:47:40.001 | UP   | DOWN | 24.0s       | no reply           |
+| 2026-05-21T15:47:43.002 | DOWN | UP   | 3.0s        | rtt=13.1ms ttl=115 |
++-------------------------+------+------+-------------+--------------------+
+  rtt ms      : min=9.8  avg=12.4  max=41.2
+  percentiles : p50=11.9  p95=18.0  p99=33.5  (n=57)
+  TTL breakdown:
+    115   : 57
+  TTL changes (1):
++-------------------------+---------+---------+
+| Timestamp               | Old TTL | New TTL |
++-------------------------+---------+---------+
+| 2026-05-21T15:47:52.100 | 115     | 116     |
++-------------------------+---------+---------+
 ```
 
 ---
@@ -289,6 +338,13 @@ python3 http_monitor.py -u https://a.example -u https://b.example -k
 python3 http_monitor.py -f url.txt -i 5 \
     --tracert-interval 60 --tracert-timeout 30 --tracert-max-hops 20
 
+# ICMP-ping every host every 2s alongside HTTP probes.
+python3 http_monitor.py -f url.txt -i 5 --ping-interval 2 --ping-timeout 2
+
+# Full picture: HTTP + ping + traceroute together.
+python3 http_monitor.py -f url.txt -i 5 \
+    --ping-interval 2 --tracert-interval 60
+
 # Tight latency anomaly thresholds for a fast endpoint.
 python3 http_monitor.py -u https://api.example/health \
     --latency-window 20 --latency-factor 1.5 --latency-min-delta-ms 20
@@ -301,7 +357,8 @@ python3 http_monitor.py -u https://api.example/health \
 `SIGINT` (Ctrl+C) and `SIGTERM` trigger an orderly shutdown:
 
 1. The current probe round finishes.
-2. Traceroute background workers are signalled to stop (2s join timeout).
+2. Traceroute and ping background workers are signalled to stop (2s join
+   timeout each).
 3. `log.txt` is flushed and closed.
 4. `summary.txt` is written.
 5. The process exits 0.
