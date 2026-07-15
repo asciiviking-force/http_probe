@@ -1,0 +1,55 @@
+# http_monitor configuration file
+# ---------------------------------------------------------------------------
+# Format : key = value   (one per line; '#' starts a comment)
+# Keys   : the long-option name, with dashes or underscores
+#          (e.g. `ping-interval` or `ping_interval`).
+# Precedence: command-line argument > this file > built-in default.
+# Loaded automatically as ./config.txt, or point at another file with
+#   python3 http_monitor.py --config myconf.txt
+# ---------------------------------------------------------------------------
+
+# --- Targets --------------------------------------------------------------
+# URLs may be listed here (repeat the key or comma-separate) or via url.txt.
+# url = https://www.google.com
+# url = https://api.example.com/health
+# Or read them from a file:
+# file = url.txt
+
+# --- Scheduling -----------------------------------------------------------
+interval = 2          # seconds between HTTP probe rounds
+count    = 0          # total rounds (0 = run until Ctrl+C)
+timeout  = 10         # per-request timeout (seconds)
+# insecure = false    # true = skip TLS certificate verification
+
+# --- Output files ---------------------------------------------------------
+# log     = log.txt
+# summary = summary.txt
+
+# --- Latency anomaly detection --------------------------------------------
+# latency-window       = 10
+# latency-factor       = 2.0
+# latency-min-delta-ms = 50
+
+# --- ICMP ping (0 = disabled) ---------------------------------------------
+# ping-interval = 2
+# ping-timeout  = 2
+
+# --- TCP ping / connect probe (0 = disabled) ------------------------------
+# Works where ICMP is filtered; tests the actual service port.
+# tcp-interval = 2
+# tcp-port     = 0     # 0 = derive from each URL (https=443, http=80)
+# tcp-timeout  = 2
+
+# --- Traceroute (0 = disabled) --------------------------------------------
+# tracert-interval = 60
+# tracert-max-hops = 20
+# tracert-timeout  = 30
+
+# --- DNS resolution via nslookup (0 = disabled) ---------------------------
+# Query each url.txt host against these DNS servers and record IP-set
+# changes. Repeat dns-server or comma-separate; omit to use the system
+# resolver.
+# nslookup-interval = 10
+# nslookup-timeout  = 5
+dns-server = 8.8.8.8
+dns-server = 1.1.1.1

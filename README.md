@@ -1,13 +1,14 @@
 # http_monitor
 
-**v1.4.1** — released 2026-05-22
+**v1.6.0** — released 2026-05-22
 Copyright (c) Viking Li &lt;viking.li@walmart.com&gt;
 
 A stand-alone Python 3 monitoring tool that repeatedly probes HTTP/HTTPS
 endpoints, classifies each outcome, detects latency anomalies, tracks
-traceroute path changes, and runs optional ICMP-ping probes — all written
-to a live terminal stream, a tab-separated per-request log, and a
-human-readable summary on exit.
+traceroute path changes, and runs optional ICMP-ping, TCP-ping, and DNS
+(nslookup) probes — all written to a live terminal stream, a tab-separated
+per-request log, and a human-readable summary on exit. Command parameters
+and DNS servers can be set in a `config.txt` file.
 
 Uses only the Python standard library. No `pip install` required.
 
@@ -34,6 +35,18 @@ Uses only the Python standard library. No `pip install` required.
   RTT (min/avg/max + p50/p95/p99), packet loss, max consecutive loss,
   TTL breakdown, plus **reachability (UP↔DOWN) and TTL change tables**
   — same style as the URL Status Change Log.
+- **TCP ping (connect probe)** — optional per-host worker measures a TCP
+  handshake to a port (default: the URL's port, e.g. https=443). Works
+  where ICMP is filtered and tests the actual service port; records
+  connect time (min/avg/max + p50/p95/p99), loss, max consecutive loss,
+  a **reachability (UP↔DOWN) change table**, and a failure breakdown.
+  Pure stdlib sockets — no external tool.
+- **DNS resolution tracking** — optional `nslookup` worker queries each
+  host against one or more specified DNS servers and records **IP-set
+  changes** in a table (round-robin reordering is ignored; only genuine
+  membership changes count).
+- **Config file** — `config.txt` sets command parameters and DNS servers
+  in `key = value` form; command-line args override it.
 - **Three output streams** — terminal, `log.txt`, and `summary.txt`,
   all carrying the version and copyright headers.
 
@@ -48,6 +61,9 @@ Uses only the Python standard library. No `pip install` required.
 - For optional ICMP ping: the system `ping` binary must be on `PATH`
   (present by default on macOS/Linux/Windows). It is normally setuid /
   setcap, so **no root is required**.
+- For optional DNS tracking: the system `nslookup` binary must be on
+  `PATH` (present by default on macOS/Linux/Windows).
+- TCP ping needs no external tool — it uses plain Python sockets.
 
 ---
 
@@ -96,12 +112,46 @@ https://internal.service.local:8443/status
 
 ---
 
+## Configuration file (`config.txt`)
+
+Any long option can be set in a `config.txt` file using `key = value`
+(dashes or underscores; `#` starts a comment, inline or full-line).
+Loaded automatically as `./config.txt`, or point elsewhere with
+`--config myconf.txt`.
+
+**Precedence:** command-line argument > `config.txt` > built-in default.
+
+```ini
+# scheduling
+interval = 2
+count    = 0
+timeout  = 10
+# insecure = true
+
+# background probes (0 = disabled)
+ping-interval    = 2
+tcp-interval     = 2
+tracert-interval = 60
+nslookup-interval = 10
+
+# DNS servers for nslookup (repeat the key or comma-separate)
+dns-server = 8.8.8.8
+dns-server = 1.1.1.1
+```
+
+List options (`url`, `dns-server`) accumulate across the file and the
+command line; scalar options are overridden by an explicit command-line
+value. Unknown keys are ignored with a warning.
+
+---
+
 ## Command-line options
 
-### Targets
+### Config & targets
 
 | Option | Description |
 |---|---|
+| `--config PATH` | Config file (default: `./config.txt` if present). |
 | `-u, --url URL` | URL to probe (may be repeated). |
 | `-f, --file FILE` | Read URLs from `FILE`, one per line. Falls back to `./url.txt` if neither `-u` nor `-f` is given. |
 
@@ -149,6 +199,22 @@ https://internal.service.local:8443/status
 | `--ping-interval SECONDS` | `0` (off) | ICMP-ping each host every N seconds. |
 | `--ping-timeout SECONDS` | `2` | Per-ping reply wait. |
 
+### TCP ping (connect probe)
+
+| Option | Default | Description |
+|---|---|---|
+| `--tcp-interval SECONDS` | `0` (off) | TCP-connect probe each host every N seconds. |
+| `--tcp-port PORT` | `0` (derive) | Port to connect to. `0` = derive from each URL (https=443, http=80, or explicit port). |
+| `--tcp-timeout SECONDS` | `2` | Per-connect timeout. |
+
+### DNS resolution (nslookup)
+
+| Option | Default | Description |
+|---|---|---|
+| `--nslookup-interval SECONDS` | `0` (off) | Resolve each host every N seconds. |
+| `--nslookup-timeout SECONDS` | `5` | Per-nslookup timeout. |
+| `--dns-server IP` | system resolver | DNS server to query (repeatable; also set via config `dns-server`). |
+
 ---
 
 ## Outputs
@@ -157,7 +223,7 @@ https://internal.service.local:8443/status
 
 ```
 ============================================================
-HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
+HTTP/HTTPS Monitor v1.6.0  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 Run started: 2026-05-21T15:47:16
 ============================================================
@@ -198,7 +264,7 @@ Tab-separated, one row per request, plus annotated event lines:
 
 ```
 # HTTP monitor log — started 2026-05-21T15:47:16
-# HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
+# HTTP/HTTPS Monitor v1.6.0  (released 2026-05-22)
 # Copyright (c) Viking Li - viking.li@walmart.com
 # timestamp	status	latency_ms	ip	url	detail
 2026-05-21T15:47:16.789	200	596.1	142.251.154.119	https://www.google.com	
@@ -207,11 +273,18 @@ Tab-separated, one row per request, plus annotated event lines:
 # tracert	2026-05-21T15:48:16.000	httpbin.org	CHANGE	10.x -> 10.y -> 18.z -> ...
 # ping	2026-05-21T15:47:17.100	www.google.com	OK	rtt=12.4ms ttl=115
 # ping	2026-05-21T15:47:18.100	www.google.com	LOSS	
+# tcpping	2026-05-21T15:47:17.200	www.google.com:443	OK	connect=11.8ms
+# tcpping	2026-05-21T15:47:18.200	www.google.com:443	FAIL	timeout
+# nslookup	2026-05-21T15:47:16.300	www.google.com	8.8.8.8	INITIAL	142.251.x.a,142.251.x.b
+# nslookup	2026-05-21T15:48:16.300	www.google.com	8.8.8.8	CHANGE	142.251.x.a,142.251.y.c
 ```
 
-Event line kinds: `# latency`, `# tracert`, and `# ping`. Ping lines are
-`# ping <ts> <host> <OK|LOSS|ERROR> <detail>` — one per ping (OK carries
-`rtt=..ms ttl=..`).
+Event line kinds: `# latency`, `# tracert`, `# ping`, `# tcpping`, and
+`# nslookup`. Ping lines are `# ping <ts> <host> <OK|LOSS|ERROR> <detail>`
+(one per ping); tcpping lines are `# tcpping <ts> <host:port> <OK|FAIL>
+<detail>` (one per probe). nslookup lines are `# nslookup <ts> <host>
+<server> <INITIAL|CHANGE|ERROR> <comma-separated-ips>` (logged only on the
+first result, on IP-set changes, and on errors — quiet otherwise).
 
 ### summary.txt
 
@@ -239,12 +312,20 @@ Sections, written on exit:
    and three ASCII tables — a **Reachability changes** table
    (`Timestamp | From | To | Prev lasted | Detail`, one row per UP↔DOWN
    transition), a **TTL changes** table, and an errors table (last 5).
+7. **Per-Host TCP Ping** — per URL/`host:port`: sent/recv/lost with loss %,
+   max consecutive loss, connect-time min/avg/max + p50/p95/p99, a
+   **Reachability changes** table (UP↔DOWN), and a failure breakdown
+   (timeout / refused / unreachable / dns failure / …).
+8. **Per-Host DNS Resolution (nslookup)** — per URL/host: a one-line
+   status per DNS server (`runs / changes / errors / current IPs`), a
+   **Resolution changes** table (`Timestamp | DNS Server | Old IPs |
+   New IPs`, combined across servers), and an errors table (last 5).
 
 Truncated example:
 
 ```
 HTTP/HTTPS Monitor Summary
-HTTP/HTTPS Monitor v1.4.1  (released 2026-05-22)
+HTTP/HTTPS Monitor v1.6.0  (released 2026-05-22)
 Copyright (c) Viking Li - viking.li@walmart.com
 ============================================================
 Started : 2026-05-21T15:47:16
@@ -318,6 +399,34 @@ URL: https://www.google.com  (host: www.google.com)
 +-------------------------+---------+---------+
 | 2026-05-21T15:47:52.100 | 115     | 116     |
 +-------------------------+---------+---------+
+
+Per-Host TCP Ping
+------------------------------------------------------------
+URL: https://www.google.com  (host: www.google.com:443)
+  sent=60  recv=58  lost=2  (3.33% loss)  max consecutive loss=2
+  Reachability changes (2):
++-------------------------+------+------+-------------+---------+
+| Timestamp               | From | To   | Prev lasted | Detail  |
++-------------------------+------+------+-------------+---------+
+| 2026-05-21T15:47:40.001 | UP   | DOWN | 24.0s       | timeout |
+| 2026-05-21T15:47:42.002 | DOWN | UP   | 2.0s        | 12.1ms  |
++-------------------------+------+------+-------------+---------+
+  connect ms  : min=9.1  avg=12.6  max=38.4
+  percentiles : p50=11.8  p95=19.2  p99=35.0  (n=58)
+  failure breakdown:
+    timeout      : 2
+
+Per-Host DNS Resolution (nslookup)
+------------------------------------------------------------
+URL: https://www.google.com  (host: www.google.com)
+  via 8.8.8.8         : runs=12  changes=1  errors=0  current=[142.251.x.a, 142.251.y.c]
+  via 1.1.1.1         : runs=12  changes=0  errors=0  current=[142.251.x.a, 142.251.x.b]
+  Resolution changes (1):
++-------------------------+------------+--------------------------+--------------------------+
+| Timestamp               | DNS Server | Old IPs                  | New IPs                  |
++-------------------------+------------+--------------------------+--------------------------+
+| 2026-05-21T15:48:16.300 | 8.8.8.8    | 142.251.x.a, 142.251.x.b | 142.251.x.a, 142.251.y.c |
++-------------------------+------------+--------------------------+--------------------------+
 ```
 
 ---
@@ -341,9 +450,23 @@ python3 http_monitor.py -f url.txt -i 5 \
 # ICMP-ping every host every 2s alongside HTTP probes.
 python3 http_monitor.py -f url.txt -i 5 --ping-interval 2 --ping-timeout 2
 
-# Full picture: HTTP + ping + traceroute together.
+# TCP-connect probe every 2s (derives port from each URL: https=443).
+python3 http_monitor.py -f url.txt -i 5 --tcp-interval 2
+
+# TCP ping a fixed port (e.g. SSH) across all hosts.
+python3 http_monitor.py -f url.txt -i 5 --tcp-interval 2 --tcp-port 22
+
+# Track DNS resolution against two servers every 10s.
 python3 http_monitor.py -f url.txt -i 5 \
-    --ping-interval 2 --tracert-interval 60
+    --nslookup-interval 10 --dns-server 8.8.8.8 --dns-server 1.1.1.1
+
+# Full picture: HTTP + ping + tcp + traceroute + nslookup together.
+python3 http_monitor.py -f url.txt -i 5 \
+    --ping-interval 2 --tcp-interval 2 --tracert-interval 60 \
+    --nslookup-interval 10 --dns-server 8.8.8.8
+
+# Drive everything from a config file.
+python3 http_monitor.py --config config.txt
 
 # Tight latency anomaly thresholds for a fast endpoint.
 python3 http_monitor.py -u https://api.example/health \
@@ -357,8 +480,8 @@ python3 http_monitor.py -u https://api.example/health \
 `SIGINT` (Ctrl+C) and `SIGTERM` trigger an orderly shutdown:
 
 1. The current probe round finishes.
-2. Traceroute and ping background workers are signalled to stop (2s join
-   timeout each).
+2. Traceroute, ping, TCP-ping, and nslookup background workers are
+   signalled to stop (2s join timeout each).
 3. `log.txt` is flushed and closed.
 4. `summary.txt` is written.
 5. The process exits 0.
@@ -375,10 +498,12 @@ python3 http_monitor.py -u https://api.example/health \
   binary uses raw sockets and requires elevated privileges. Errors are
   captured per host in the summary's traceroute error table; the monitor
   itself does not abort.
-- **DNS round-robin** — when a host has multiple A records, each probe
-  may resolve to a different IP. This is normal behaviour and the
-  resulting IP changes will appear in the Status Change Log; suppress
-  them by pinning to a single resolver if undesired.
+- **DNS round-robin** — when a host has multiple A records, each HTTP
+  probe may resolve to a different IP. This is normal and the resulting
+  IP changes appear in the Status Change Log. Note the distinction from
+  the **nslookup** section: nslookup compares the full resolved IP **set**
+  (order-independent), so round-robin reordering is *not* counted — only
+  genuine additions/removals of an IP are recorded as a change.
 - **Latency baseline ignores failures** — only HTTP responses with a
   numeric status code contribute to the rolling latency window, so DNS
   failures and timeouts do not poison the baseline.
@@ -392,6 +517,7 @@ python3 http_monitor.py -u https://api.example/health \
 | `http_monitor.py` | The script. |
 | `http_monitor.1` | troff/man page (section 1). |
 | `README.md` | This file. |
+| `config.txt` | Optional config (command params + DNS servers). |
 | `url.txt` | Optional default input file. |
 | `log.txt` | Generated per-request log. |
 | `summary.txt` | Generated summary. |

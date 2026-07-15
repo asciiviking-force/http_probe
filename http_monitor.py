@@ -8,21 +8,25 @@ status-change log plus per-URL statistics to summary.txt on exit.
 
 Uses only the Python standard library — no external dependencies.
 
-Optionally runs background traceroute and ICMP-ping probes per host (via the
-system binaries — no raw sockets / root needed).
+Optionally runs background traceroute, ICMP-ping, TCP-ping (connect probe),
+and nslookup probes per host. Command parameters and DNS servers can also be
+set in a config.txt file.
 
 Examples:
     python3 http_monitor.py -u https://example.com -i 2
     python3 http_monitor.py -f url.txt -i 1 -c 100
     python3 http_monitor.py -u https://a.com -u https://b.com -i 5
     python3 http_monitor.py -f url.txt --ping-interval 2 --tracert-interval 60
+    python3 http_monitor.py -f url.txt --nslookup-interval 10 \
+        --dns-server 8.8.8.8 --dns-server 1.1.1.1
+    python3 http_monitor.py --config config.txt
 
 Copyright (c) Viking Li <viking.li@walmart.com>. All rights reserved.
 """
 
 __author__ = "Viking Li <viking.li@walmart.com>"
 __copyright__ = "Copyright (c) Viking Li <viking.li@walmart.com>"
-__version__ = "1.4.1"
+__version__ = "1.6.0"
 __date__ = "2026-05-22"
 
 # Bookkeeping cap for tracert state. See tracert_worker / write_summary.
@@ -43,6 +47,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _script_dir]
 
 import argparse
+import errno
 import ipaddress
 import re
 import shutil
@@ -86,6 +91,69 @@ def load_urls(url_args, file_path):
             seen.add(u)
             deduped.append(u)
     return deduped
+
+
+def load_config(path, parser):
+    """Parse a key=value config file into {argparse_dest: value}.
+
+    - Keys use the long-option spelling with dashes or underscores
+      (e.g. `ping-interval` or `ping_interval`).
+    - Types are taken from the parser's option definitions.
+    - Append options (--url, --dns-server) accept comma-separated values
+      and/or repeated keys; they accumulate into a list.
+    - Boolean flags (--insecure) accept true/false/yes/no/on/off/1/0.
+    - Unknown keys are ignored with a warning.
+
+    Precedence is enforced by the caller via parser.set_defaults(), so an
+    explicit command-line value always wins over the config file.
+    """
+    cfg = {}
+    p = Path(path)
+    if not p.is_file():
+        return cfg
+    actions = {a.dest: a for a in parser._actions}
+    list_dests = {a.dest for a in parser._actions
+                  if isinstance(a, argparse._AppendAction)}
+    bool_dests = {a.dest for a in parser._actions
+                  if isinstance(a, (argparse._StoreTrueAction,
+                                    argparse._StoreFalseAction))}
+    raw = {}
+    for lineno, line in enumerate(p.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            sys.stderr.write(f"config {path}:{lineno}: ignoring malformed "
+                             f"line (no '='): {line}\n")
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip().replace("-", "_")
+        # Strip inline comments (whitespace + '#' to end-of-line). The leading
+        # whitespace requirement avoids clobbering '#' inside a value such as
+        # a URL fragment.
+        val = re.split(r"\s+#", val, 1)[0].strip()
+        if key not in actions:
+            sys.stderr.write(f"config {path}:{lineno}: unknown key '{key}' "
+                             f"(ignored)\n")
+            continue
+        if key in list_dests:
+            items = [x.strip() for x in val.split(",") if x.strip()]
+            raw.setdefault(key, []).extend(items)
+        else:
+            raw[key] = val
+    for dest, val in raw.items():
+        if dest in list_dests:
+            cfg[dest] = val  # list of strings
+        elif dest in bool_dests:
+            cfg[dest] = str(val).lower() in ("1", "true", "yes", "on")
+        else:
+            conv = actions[dest].type or str
+            try:
+                cfg[dest] = conv(val)
+            except (ValueError, TypeError):
+                sys.stderr.write(f"config {path}: bad value for '{dest}': "
+                                 f"{val!r} (ignored)\n")
+    return cfg
 
 
 def classify_error(exc):
@@ -455,6 +523,229 @@ def ping_worker(host, interval, timeout, mode,
             slept += chunk
 
 
+# ---------------------------------------------------------------------------
+# DNS resolution tracking via the system `nslookup` binary.
+# ---------------------------------------------------------------------------
+# An answer line is "Address: <ip>" (no port); the server line is
+# "Address:\t<ip>#53" (has '#'), which we skip.
+_NS_ADDR_RE = re.compile(r"^Address(?:es)?:\s*(\S+)", re.IGNORECASE)
+
+
+def find_nslookup_cmd():
+    """Return 'nslookup' if available, else None."""
+    return "nslookup" if shutil.which("nslookup") else None
+
+
+def run_nslookup(host, server, timeout):
+    """Resolve `host` via `server` using nslookup.
+
+    Returns (sorted_ip_tuple, error_or_None). `server` may be the sentinel
+    "system" to use the OS default resolver (no server argument).
+    """
+    if not shutil.which("nslookup"):
+        return None, "nslookup binary not found"
+    cmd = ["nslookup", host]
+    if server and server != "system":
+        cmd.append(server)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"nslookup timed out after {timeout}s"
+    except FileNotFoundError as exc:
+        return None, f"nslookup binary missing: {exc}"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    low = text.lower()
+    if "nxdomain" in low or "can't find" in low or "no answer" in low:
+        return None, "NXDOMAIN / no answer"
+    if "no servers could be reached" in low or "connection timed out" in low:
+        return None, "server unreachable"
+    if "servfail" in low:
+        return None, "SERVFAIL"
+
+    ips = []
+    # Skip the header block (Server:/Address:#53) — the answer Address lines
+    # do not carry a '#port' suffix.
+    for line in text.splitlines():
+        m = _NS_ADDR_RE.match(line.strip())
+        if not m:
+            continue
+        val = m.group(1)
+        if "#" in val:
+            continue  # server address line
+        ips.append(val)
+    if not ips:
+        # Non-zero exit or unparseable output → surface last stderr line.
+        if result.returncode != 0 and result.stderr.strip():
+            return None, result.stderr.strip().splitlines()[-1]
+        return None, "no addresses returned"
+    return tuple(sorted(set(ips))), None
+
+
+def nslookup_worker(host, servers, interval, timeout, ns_state,
+                    lock, stop_event, log_f, log_lock):
+    """Periodically resolve `host` via each DNS server, recording IP-set
+    changes. IPs are compared as a sorted set, so DNS round-robin reordering
+    is not counted as a change — only genuine membership changes are.
+    """
+    last = {srv: None for srv in servers}
+    while not stop_event.is_set():
+        for server in servers:
+            if stop_event.is_set():
+                break
+            ips, err = run_nslookup(host, server, timeout)
+            ts = datetime.now().isoformat(timespec="milliseconds")
+            msg = None
+            with lock:
+                entry = ns_state[host][server]
+                entry["runs"] += 1
+                if err:
+                    entry["errors"].append((ts, err))
+                    log_kind, log_val = "ERROR", err
+                    msg = f"[{ts}] NSLOOKUP {host:<28} @{server:<15} ERROR  {err}"
+                else:
+                    entry["current"] = ips
+                    prev = last[server]
+                    if prev is None:
+                        entry["initial"] = ips
+                        log_kind = "INITIAL"
+                        log_val = ",".join(ips)
+                        msg = (f"[{ts}] NSLOOKUP {host:<28} @{server:<15} "
+                               f"INITIAL {len(ips)} ip(s): {', '.join(ips)}")
+                    elif prev != ips:
+                        entry["total_changes"] += 1
+                        entry["changes"].append((ts, prev, ips))
+                        log_kind = "CHANGE"
+                        log_val = ",".join(ips)
+                        added = [i for i in ips if i not in prev]
+                        removed = [i for i in prev if i not in ips]
+                        brief = []
+                        if added:
+                            brief.append("+" + ",".join(added))
+                        if removed:
+                            brief.append("-" + ",".join(removed))
+                        msg = (f"[{ts}] NSLOOKUP {host:<28} @{server:<15} "
+                               f"*DNS CHANGE* {' '.join(brief)}")
+                    else:
+                        log_kind = None  # unchanged, stay quiet
+                    last[server] = ips
+            if msg:
+                print(msg)
+            if log_kind:
+                with log_lock:
+                    log_f.write(
+                        f"# nslookup\t{ts}\t{host}\t{server}\t{log_kind}\t{log_val}\n")
+        # Sleep with responsiveness to stop signal.
+        slept = 0.0
+        while slept < interval and not stop_event.is_set():
+            chunk = min(0.5, interval - slept)
+            time.sleep(chunk)
+            slept += chunk
+
+
+# ---------------------------------------------------------------------------
+# TCP ping — measure a TCP connect (handshake) to host:port. Works where
+# ICMP is filtered and tests the actual service port. Pure stdlib sockets.
+# ---------------------------------------------------------------------------
+def _classify_tcp_error(exc):
+    """Short label for a TCP connect failure."""
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, ConnectionRefusedError):
+        return "refused"
+    if isinstance(exc, socket.gaierror):
+        return "dns failure"
+    if isinstance(exc, ConnectionResetError):
+        return "reset"
+    if isinstance(exc, OSError):
+        en = getattr(exc, "errno", None)
+        if en in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+            return "unreachable"
+        return exc.strerror or f"errno {en}"
+    return type(exc).__name__
+
+
+def run_tcp_ping(host, port, timeout):
+    """Attempt a TCP connect to host:port. Returns (connect_ms_or_None, err).
+
+    connect_ms is None on failure; err is a short label (None on success).
+    """
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            elapsed_ms = (time.monotonic() - started) * 1000
+        return elapsed_ms, None
+    except Exception as exc:
+        return None, _classify_tcp_error(exc)
+
+
+def tcp_ping_worker(host, port, interval, timeout,
+                    tcp_state, lock, stop_event, log_f, log_lock):
+    """Periodically TCP-connect to host:port, recording connect time / loss /
+    reachability (UP<->DOWN) transitions. Terminal output is quiet: only the
+    first failure of a streak, recovery, and errors are announced."""
+    while not stop_event.is_set():
+        connect_ms, err = run_tcp_ping(host, port, timeout)
+        now_dt = datetime.now()
+        ts = now_dt.isoformat(timespec="milliseconds")
+        msg = None
+        with lock:
+            entry = tcp_state[host]
+            entry["sent"] += 1
+            if err is not None:
+                entry["lost"] += 1
+                entry["consecutive_losses"] += 1
+                entry["max_consecutive_losses"] = max(
+                    entry["max_consecutive_losses"], entry["consecutive_losses"])
+                entry["fail_reasons"][err] += 1
+                # Only announce the first failure of a streak.
+                if entry["consecutive_losses"] == 1:
+                    msg = (f"[{ts}] TCPPING {host + ':' + str(port):<28} "
+                           f"*FAIL*  {err}")
+                log_kind, log_val = "FAIL", err
+                cur_reach, reach_detail = "DOWN", err
+            else:
+                prev_streak = entry["consecutive_losses"]
+                entry["consecutive_losses"] = 0
+                entry["recv"] += 1
+                entry["ct_total"] += connect_ms
+                entry["ct_min"] = min(entry["ct_min"], connect_ms)
+                entry["ct_max"] = max(entry["ct_max"], connect_ms)
+                entry["cts"].append(connect_ms)
+                if prev_streak > 0:
+                    msg = (f"[{ts}] TCPPING {host + ':' + str(port):<28} "
+                           f"RECOVERED after {prev_streak} fail  "
+                           f"{connect_ms:.1f}ms")
+                log_kind = "OK"
+                log_val = f"connect={connect_ms:.1f}ms"
+                cur_reach, reach_detail = "UP", f"{connect_ms:.1f}ms"
+
+            # Reachability transition tracking (mirrors ICMP ping / URL log).
+            prev_reach = entry["reach_state"]
+            if prev_reach is None:
+                entry["reach_state"] = cur_reach
+                entry["reach_since"] = now_dt
+            elif prev_reach != cur_reach:
+                prev_lasted = (now_dt - entry["reach_since"]).total_seconds()
+                entry["reach_changes"].append(
+                    (ts, prev_reach, cur_reach, prev_lasted, reach_detail))
+                entry["reach_state"] = cur_reach
+                entry["reach_since"] = now_dt
+        if msg:
+            print(msg)
+        with log_lock:
+            log_f.write(f"# tcpping\t{ts}\t{host}:{port}\t{log_kind}\t{log_val}\n")
+        # Sleep with responsiveness to stop signal.
+        slept = 0.0
+        while slept < interval and not stop_event.is_set():
+            chunk = min(0.5, interval - slept)
+            time.sleep(chunk)
+            slept += chunk
+
+
 def percentile(sorted_values, p):
     if not sorted_values:
         return 0.0
@@ -572,7 +863,8 @@ def _render_snapshots_table(snaps):
 
 
 def write_summary(path, urls, stats, changes, latency_events, tracert_state,
-                  ping_state, url_hosts, started_at, ended_at, total_requests):
+                  ping_state, tcp_state, ns_state, dns_servers, url_hosts,
+                  started_at, ended_at, total_requests):
     lines = []
     lines.append("HTTP/HTTPS Monitor Summary")
     lines.append(VERSION_BANNER)
@@ -797,12 +1089,131 @@ def write_summary(path, urls, stats, changes, latency_events, tracert_state,
             lines.append("(no ping results yet)")
     lines.append("")
 
+    # -- TCP ping (connect probe) -------------------------------------------
+    lines.append("Per-Host TCP Ping")
+    lines.append("-" * 60)
+    if not tcp_state:
+        lines.append("(tcp ping disabled)")
+    else:
+        any_tcp = False
+        for url in urls:
+            host = url_hosts.get(url)
+            if not host or host not in tcp_state:
+                continue
+            p = tcp_state[host]
+            sent = p.get("sent", 0)
+            if sent == 0:
+                continue
+            any_tcp = True
+            port = p.get("port")
+            recv = p.get("recv", 0)
+            lost = p.get("lost", 0)
+            loss_pct = (lost / sent * 100) if sent else 0.0
+            lines.append(f"URL: {url}  (host: {host}:{port})")
+            lines.append(
+                f"  sent={sent}  recv={recv}  lost={lost}  "
+                f"({loss_pct:.2f}% loss)  "
+                f"max consecutive loss={p.get('max_consecutive_losses', 0)}")
+            reach_changes = p.get("reach_changes", [])
+            if reach_changes:
+                lines.append(f"  Reachability changes ({len(reach_changes)}):")
+                body = [[ts, frm, to, f"{dur:.1f}s", detail]
+                        for ts, frm, to, dur, detail in reach_changes]
+                lines.extend(_render_table(
+                    ["Timestamp", "From", "To", "Prev lasted", "Detail"], body))
+            if recv > 0:
+                avg = p["ct_total"] / recv
+                lines.append(
+                    f"  connect ms  : min={p['ct_min']:.1f}  "
+                    f"avg={avg:.1f}  max={p['ct_max']:.1f}")
+                samples = sorted(p.get("cts", []))
+                if samples:
+                    lines.append(
+                        f"  percentiles : p50={percentile(samples, 50):.1f}  "
+                        f"p95={percentile(samples, 95):.1f}  "
+                        f"p99={percentile(samples, 99):.1f}  (n={len(samples)})")
+            else:
+                lines.append("  connect ms  : (no successful connects)")
+            reasons = p.get("fail_reasons", {})
+            if reasons:
+                lines.append("  failure breakdown:")
+                for r in sorted(reasons, key=lambda k: -reasons[k]):
+                    lines.append(f"    {r:<12} : {reasons[r]}")
+            lines.append("")
+        if not any_tcp:
+            lines.append("(no tcp ping results yet)")
+    lines.append("")
+
+    # -- DNS resolution (nslookup) ------------------------------------------
+    lines.append("Per-Host DNS Resolution (nslookup)")
+    lines.append("-" * 60)
+    if not ns_state:
+        lines.append("(nslookup disabled)")
+    else:
+        any_ns = False
+        for url in urls:
+            host = url_hosts.get(url)
+            if not host or host not in ns_state:
+                continue
+            servers = ns_state[host]
+            # Skip hosts that produced nothing at all.
+            if not any(sv.get("runs", 0) for sv in servers.values()):
+                continue
+            any_ns = True
+            lines.append(f"URL: {url}  (host: {host})")
+            # Per-server one-line status.
+            for srv in dns_servers:
+                sv = servers.get(srv)
+                if not sv:
+                    continue
+                cur = sv.get("current")
+                cur_str = ", ".join(cur) if cur else "(none)"
+                lines.append(
+                    f"  via {srv:<15} : runs={sv.get('runs', 0)}  "
+                    f"changes={sv.get('total_changes', 0)}  "
+                    f"errors={len(sv.get('errors', []))}  "
+                    f"current=[{cur_str}]")
+            # Combined resolution-change table across all servers for this host.
+            rows = []
+            for srv in dns_servers:
+                sv = servers.get(srv)
+                if not sv:
+                    continue
+                for ts, old, new in sv.get("changes", []):
+                    rows.append([ts, srv, ", ".join(old), ", ".join(new)])
+            if rows:
+                rows.sort(key=lambda r: r[0])
+                lines.append(f"  Resolution changes ({len(rows)}):")
+                lines.extend(_render_table(
+                    ["Timestamp", "DNS Server", "Old IPs", "New IPs"], rows))
+            # Combined error table (last 5 across servers).
+            err_rows = []
+            for srv in dns_servers:
+                sv = servers.get(srv)
+                if not sv:
+                    continue
+                for ts, err in sv.get("errors", []):
+                    err_rows.append([ts, srv, err])
+            if err_rows:
+                err_rows.sort(key=lambda r: r[0])
+                shown = err_rows[-5:]
+                lines.append(f"  Errors (last {len(shown)} of {len(err_rows)}):")
+                lines.extend(_render_table(
+                    ["Timestamp", "DNS Server", "Error"], shown))
+            lines.append("")
+        if not any_ns:
+            lines.append("(no nslookup results yet)")
+    lines.append("")
+
     Path(path).write_text("\n".join(lines))
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Repeatedly probe HTTP/HTTPS URLs and log status codes.")
+    parser.add_argument("--config", default="config.txt",
+                        help="Config file with command params + dns servers "
+                             "(default: config.txt if present).")
     parser.add_argument("-u", "--url", action="append", default=[],
                         help="URL to probe (repeatable).")
     parser.add_argument("-f", "--file",
@@ -840,6 +1251,32 @@ def main():
                              "(default: 0 = disabled; suggested: 1-5).")
     parser.add_argument("--ping-timeout", type=float, default=2.0,
                         help="Per-ping reply wait in seconds (default: 2).")
+    parser.add_argument("--tcp-interval", type=float, default=0.0,
+                        help="TCP-connect probe each host every N seconds "
+                             "(default: 0 = disabled; suggested: 1-5).")
+    parser.add_argument("--tcp-port", type=int, default=0,
+                        help="Port for TCP ping (default: 0 = derive from each "
+                             "URL's scheme/port, e.g. https=443, http=80).")
+    parser.add_argument("--tcp-timeout", type=float, default=2.0,
+                        help="Per TCP-connect timeout in seconds (default: 2).")
+    parser.add_argument("--dns-server", action="append", default=[],
+                        help="DNS server for nslookup queries (repeatable; "
+                             "also settable in config as dns-server).")
+    parser.add_argument("--nslookup-interval", type=float, default=0.0,
+                        help="nslookup each host every N seconds "
+                             "(default: 0 = disabled; suggested: 5-30).")
+    parser.add_argument("--nslookup-timeout", type=float, default=5.0,
+                        help="Per-nslookup timeout in seconds (default: 5).")
+
+    # Resolve the config path from the command line first, then fold config
+    # values in as defaults so explicit CLI args still win.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="config.txt")
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_config(pre_args.config, parser)
+    if cfg:
+        parser.set_defaults(**cfg)
+
     args = parser.parse_args()
 
     if args.interval < 0:
@@ -874,13 +1311,27 @@ def main():
         if h:
             url_hosts[u] = h
 
-    # Unique hosts, preserving first-seen order (shared by tracert + ping).
+    # Unique hosts, preserving first-seen order (shared by tracert / ping / tcp).
     unique_hosts = []
     seen_hosts = set()
     for h in url_hosts.values():
         if h not in seen_hosts:
             seen_hosts.add(h)
             unique_hosts.append(h)
+
+    # Derive a TCP port per host: --tcp-port overrides; else the port of the
+    # first URL that maps to that host (https=443, http=80, or explicit).
+    host_ports = {}
+    for u in urls:
+        parsed = urlparse(u)
+        h = parsed.hostname
+        if not h or h in host_ports:
+            continue
+        if args.tcp_port:
+            host_ports[h] = args.tcp_port
+        else:
+            host_ports[h] = parsed.port or (443 if parsed.scheme == "https"
+                                            else 80)
 
     # Set up tracert workers (one per unique host) if enabled.
     tracert_state = {}
@@ -923,6 +1374,46 @@ def main():
                                  "reach_changes": [],
                                  "errors": []}
 
+    # Set up TCP-ping workers (one per unique host) if enabled.
+    tcp_state = {}
+    tcp_threads = []
+    tcp_stop = threading.Event()
+    tcp_lock = threading.Lock()
+    if args.tcp_interval > 0:
+        for h in unique_hosts:
+            tcp_state[h] = {"port": host_ports.get(h, 80),
+                            "sent": 0, "recv": 0, "lost": 0,
+                            "cts": [], "ct_total": 0.0,
+                            "ct_min": float("inf"), "ct_max": 0.0,
+                            "consecutive_losses": 0,
+                            "max_consecutive_losses": 0,
+                            "reach_state": None, "reach_since": None,
+                            "reach_changes": [],
+                            "fail_reasons": defaultdict(int)}
+
+    # Set up nslookup workers (one per unique host) if enabled.
+    ns_state = {}
+    ns_threads = []
+    ns_stop = threading.Event()
+    ns_lock = threading.Lock()
+    # De-dup DNS servers, preserving order; fall back to system resolver.
+    dns_servers = []
+    for srv in args.dns_server:
+        srv = srv.strip()
+        if srv and srv not in dns_servers:
+            dns_servers.append(srv)
+    if not dns_servers:
+        dns_servers = ["system"]
+    if args.nslookup_interval > 0:
+        if find_nslookup_cmd() is None:
+            print("WARNING: nslookup binary not found — DNS tracking disabled.")
+        else:
+            for h in unique_hosts:
+                ns_state[h] = {srv: {"runs": 0, "initial": None,
+                                     "current": None, "changes": [],
+                                     "errors": [], "total_changes": 0}
+                               for srv in dns_servers}
+
     print("=" * 60)
     print(VERSION_BANNER)
     print(COPYRIGHT_NOTICE)
@@ -938,13 +1429,22 @@ def main():
     if ping_state:
         print(f"ICMP ping: every {args.ping_interval}s for "
               f"{len(ping_state)} host(s) (wait {args.ping_timeout}s)")
+    if tcp_state:
+        ports = sorted({e["port"] for e in tcp_state.values()})
+        print(f"TCP ping: every {args.tcp_interval}s for "
+              f"{len(tcp_state)} host(s) on port(s) "
+              f"{', '.join(map(str, ports))} (wait {args.tcp_timeout}s)")
+    if ns_state:
+        print(f"nslookup: every {args.nslookup_interval}s for "
+              f"{len(ns_state)} host(s) via {len(dns_servers)} server(s) "
+              f"[{', '.join(dns_servers)}]")
 
     log_f = open(args.log, "w", buffering=1)
     log_f.write(f"# HTTP monitor log — started {started_at.isoformat(timespec='seconds')}\n")
     log_f.write(f"# {VERSION_BANNER}\n")
     log_f.write(f"# {COPYRIGHT_NOTICE}\n")
     log_f.write("# Per-request rows:  timestamp\\tstatus\\tlatency_ms\\tip\\turl\\tdetail\n")
-    log_f.write("# Event lines start with '# latency', '# tracert', or '# ping'.\n")
+    log_f.write("# Event lines: '# latency', '# tracert', '# ping', '# tcpping', '# nslookup'.\n")
     log_f.write("# timestamp\tstatus\tlatency_ms\tip\turl\tdetail\n")
 
     # Now that log_f exists, start tracert workers.
@@ -971,6 +1471,30 @@ def main():
                 name=f"ping-{h}", daemon=True)
             t.start()
             ping_threads.append(t)
+
+    # Start TCP-ping workers.
+    if tcp_state:
+        for h in tcp_state.keys():
+            t = threading.Thread(
+                target=tcp_ping_worker,
+                args=(h, tcp_state[h]["port"], args.tcp_interval,
+                      args.tcp_timeout, tcp_state, tcp_lock, tcp_stop,
+                      log_f, log_lock),
+                name=f"tcpping-{h}", daemon=True)
+            t.start()
+            tcp_threads.append(t)
+
+    # Start nslookup workers.
+    if ns_state:
+        for h in ns_state.keys():
+            t = threading.Thread(
+                target=nslookup_worker,
+                args=(h, dns_servers, args.nslookup_interval,
+                      args.nslookup_timeout, ns_state, ns_lock, ns_stop,
+                      log_f, log_lock),
+                name=f"nslookup-{h}", daemon=True)
+            t.start()
+            ns_threads.append(t)
 
     stop = {"flag": False}
 
@@ -1080,9 +1604,15 @@ def main():
         # Signal background workers and give them a moment to exit cleanly.
         tracert_stop.set()
         ping_stop.set()
+        tcp_stop.set()
+        ns_stop.set()
         for t in tracert_threads:
             t.join(timeout=2.0)
         for t in ping_threads:
+            t.join(timeout=2.0)
+        for t in tcp_threads:
+            t.join(timeout=2.0)
+        for t in ns_threads:
             t.join(timeout=2.0)
         with log_lock:
             log_f.close()
@@ -1114,8 +1644,34 @@ def main():
                     "max_consecutive_losses": v.get("max_consecutive_losses", 0),
                     "errors": list(v.get("errors", []))}
                 for h, v in ping_state.items()}
+        # Snapshot TCP-ping state under the lock for a consistent summary.
+        with tcp_lock:
+            tcp_snapshot = {
+                h: {"port": v.get("port"),
+                    "sent": v.get("sent", 0), "recv": v.get("recv", 0),
+                    "lost": v.get("lost", 0),
+                    "cts": list(v.get("cts", [])),
+                    "ct_total": v.get("ct_total", 0.0),
+                    "ct_min": v.get("ct_min", float("inf")),
+                    "ct_max": v.get("ct_max", 0.0),
+                    "reach_changes": list(v.get("reach_changes", [])),
+                    "max_consecutive_losses": v.get("max_consecutive_losses", 0),
+                    "fail_reasons": dict(v.get("fail_reasons", {}))}
+                for h, v in tcp_state.items()}
+        # Snapshot nslookup state under the lock for a consistent summary.
+        with ns_lock:
+            ns_snapshot = {
+                h: {srv: {"runs": sv.get("runs", 0),
+                          "initial": sv.get("initial"),
+                          "current": sv.get("current"),
+                          "changes": list(sv.get("changes", [])),
+                          "errors": list(sv.get("errors", [])),
+                          "total_changes": sv.get("total_changes", 0)}
+                    for srv, sv in servers.items()}
+                for h, servers in ns_state.items()}
         write_summary(args.summary, urls, stats, changes,
-                      latency_events, tracert_snapshot, ping_snapshot, url_hosts,
+                      latency_events, tracert_snapshot, ping_snapshot,
+                      tcp_snapshot, ns_snapshot, dns_servers, url_hosts,
                       started_at, ended_at, total_requests)
         print(f"\nLog saved to {args.log}")
         print(f"Summary saved to {args.summary}")
